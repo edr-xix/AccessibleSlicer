@@ -4,12 +4,17 @@ import serial
 import time
 import os
 import shutil
+import platform
+import json
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QTabWidget, QVBoxLayout,
     QLabel, QPushButton, QFileDialog, QHBoxLayout, QTextEdit, QLineEdit,
-    QCheckBox, QMessageBox, QSpinBox, QGridLayout, QGroupBox, QRadioButton, QFormLayout, QDialog
+    QCheckBox, QMessageBox, QSpinBox, QGridLayout, QGroupBox, QRadioButton, QFormLayout, QDialog,
+    QKeySequenceEdit
 )
-from PyQt6.QtCore import QSettings, QTimer, QCoreApplication, Qt, QSize
+from PyQt6.QtCore import QSettings, QTimer, QCoreApplication, Qt, QSize, QThread, pyqtSignal
+from PyQt6.QtGui import QKeySequence, QShortcut
+from pathlib import Path
 
 # -----------------------------
 # 1. CONFIGURATION CONSTANTS 🛠️
@@ -29,6 +34,48 @@ except ImportError:
     SERIAL_PORTS = ["COM1", "/dev/ttyUSB0", "COM3", "/dev/tty.usbmodem1234"] 
 except Exception:
     SERIAL_PORTS = ["COM1", "/dev/ttyUSB0", "COM3", "/dev/tty.usbmodem1234"] 
+
+
+def find_prusaslicer() -> str | None:
+    """Attempt to locate a PrusaSlicer CLI executable on the host system.
+
+    Returns the full path to the executable if found, else None.
+    """
+    # Try shutil.which candidates first
+    candidates = ["prusa-slicer", "prusa-slicer-console", "prusa_slicer"]
+    if os.name == 'nt':
+        # Windows executable names
+        candidates = [c + ".exe" for c in candidates] + candidates
+
+    for c in candidates:
+        p = shutil.which(c)
+        if p:
+            return p
+
+    # Platform-specific typical locations
+    system = platform.system().lower()
+    if system.startswith('windows'):
+        prog = os.environ.get('ProgramFiles', r'C:\Program Files')
+        possible = [
+            os.path.join(prog, 'Prusa3D', 'PrusaSlicer', 'prusa-slicer.exe'),
+            os.path.join(prog, 'PrusaSlicer', 'prusa-slicer.exe'),
+        ]
+        for p in possible:
+            if os.path.exists(p):
+                return p
+
+    elif system == 'darwin':
+        app_path = '/Applications/PrusaSlicer.app/Contents/MacOS/PrusaSlicer'
+        if os.path.exists(app_path):
+            return app_path
+
+    else:
+        # Linux common paths
+        for p in ['/usr/bin/prusa-slicer', '/usr/bin/prusa-slicer-console', '/snap/bin/prusa-slicer']:
+            if os.path.exists(p):
+                return p
+
+    return None
 
 # -----------------------------
 # 2. Controller and Dialog Classes 💻
@@ -231,6 +278,101 @@ class PrinterController:
                     except ValueError: pass
         return self.printer_status
 
+
+# -----------------------------
+#  Slicing and Sending threads
+# -----------------------------
+class SlicingThread(QThread):
+    finished_signal = pyqtSignal(int, str)  # returncode, output_path
+    output_signal = pyqtSignal(str)
+
+    def __init__(self, input_stl: str, output_gcode: str, slicer_exec: str | None = None):
+        super().__init__()
+        self.input_stl = input_stl
+        self.output_gcode = output_gcode
+        self.slicer_exec = slicer_exec
+
+    def run(self):
+        # Determine command
+        cmd = None
+        if self.slicer_exec:
+            cmd = [self.slicer_exec, '--export-gcode', '-o', self.output_gcode, self.input_stl]
+        else:
+            # try common executables
+            for candidate in ('prusa-slicer', 'prusa-slicer-console', 'prusa_slicer'):
+                if shutil.which(candidate):
+                    cmd = [candidate, '--export-gcode', '-o', self.output_gcode, self.input_stl]
+                    break
+
+        if cmd is None:
+            self.output_signal.emit('PrusaSlicer CLI not found. Please set the path in the Slicer tab.')
+            self.finished_signal.emit(1, '')
+            return
+
+        # Run command and stream output
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        except Exception as e:
+            self.output_signal.emit(f'Failed to run slicer: {e}')
+            self.finished_signal.emit(1, '')
+            return
+
+        # Read stdout lines and emit
+        if proc.stdout:
+            for line in proc.stdout:
+                self.output_signal.emit(line.rstrip())
+
+        proc.wait()
+        self.finished_signal.emit(proc.returncode, self.output_gcode if proc.returncode == 0 else '')
+
+
+class SendingThread(QThread):
+    progress_signal = pyqtSignal(int)
+    finished_signal = pyqtSignal()
+
+    def __init__(self, gcode_path: str, controller: PrinterController):
+        super().__init__()
+        self.gcode_path = gcode_path
+        self.controller = controller
+
+    def run(self):
+        try:
+            with open(self.gcode_path, 'r', encoding='utf-8', errors='ignore') as fh:
+                lines = fh.readlines()
+        except Exception:
+            self.finished_signal.emit()
+            return
+
+        total = len(lines)
+        if total == 0:
+            self.finished_signal.emit()
+            return
+
+        sent = 0
+        for i, raw in enumerate(lines):
+            line = raw.strip()
+            if not line:
+                continue
+            # Write raw to serial if connected
+            try:
+                if self.controller and self.controller.is_connected and self.controller.ser and self.controller.ser.is_open:
+                    try:
+                        self.controller.ser.write((line + '\n').encode('utf-8'))
+                    except Exception:
+                        # if direct write fails, try controller method
+                        self.controller._send_raw_command(line, wait_for_response=False)
+                # simple pacing
+                time.sleep(0.005)
+            except Exception:
+                pass
+
+            sent += 1
+            pct = int((sent / total) * 100)
+            self.progress_signal.emit(pct)
+
+        self.finished_signal.emit()
+
+
 class AccessibleSlicerWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -276,18 +418,144 @@ class AccessibleSlicerWindow(QMainWindow):
         return group
         
     def _create_slicer_tab(self):
+        # Build the full Slicer tab UI
         tab = QWidget()
         layout = QVBoxLayout(tab)
+
+        # Top: current selections summary
+        summary_group = QGroupBox("Current Slicer Profile")
+        summary_layout = QHBoxLayout(summary_group)
         self.current_printer_label = QLabel(self.selected_printer)
         self.current_filament_label = QLabel(self.selected_filament)
         self.current_quality_label = QLabel(self.selected_quality)
-        self.file_btn = QPushButton()
-        self.slice_btn = QPushButton()
-        self.export_btn = QPushButton()
-        self.send_btn = QPushButton()
+        summary_layout.addWidget(QLabel("Printer:"))
+        summary_layout.addWidget(self.current_printer_label)
+        summary_layout.addSpacing(10)
+        summary_layout.addWidget(QLabel("Filament:"))
+        summary_layout.addWidget(self.current_filament_label)
+        summary_layout.addSpacing(10)
+        summary_layout.addWidget(QLabel("Quality:"))
+        summary_layout.addWidget(self.current_quality_label)
+        layout.addWidget(summary_group)
+
+        # File selection
+        file_hlayout = QHBoxLayout()
+        self.file_btn = QPushButton("Select STL File")
+        self.file_btn.setAccessibleName("Select STL file to slice")
         self.selected_file_label = QLabel("No file selected")
+        file_hlayout.addWidget(self.file_btn)
+        file_hlayout.addWidget(self.selected_file_label)
+        layout.addLayout(file_hlayout)
+
+        # Slicer executable path and options
+        slicer_group = QGroupBox("Slicer / Output")
+        slicer_layout = QHBoxLayout(slicer_group)
+        self.slicer_path_line = QLineEdit()
+        self.slicer_path_line.setPlaceholderText("Path to PrusaSlicer CLI (optional)")
+        self.slicer_path_line.setAccessibleName("PrusaSlicer CLI path")
+        self.slice_btn = QPushButton("Slice (PrusaSlicer)")
+        self.slice_btn.setEnabled(False)
+        slicer_layout.addWidget(self.slicer_path_line)
+        slicer_layout.addWidget(self.slice_btn)
+        layout.addWidget(slicer_group)
+
+        # Actions: export and send
+        actions_h = QHBoxLayout()
+        self.export_btn = QPushButton("Export G-code")
+        self.export_btn.setEnabled(False)
+        self.send_btn = QPushButton("Send to Printer")
+        self.send_btn.setEnabled(False)
+        actions_h.addWidget(self.export_btn)
+        actions_h.addWidget(self.send_btn)
+        layout.addLayout(actions_h)
+
+        # Status and console output
         self.status_label = QLabel("")
+        layout.addWidget(self.status_label)
+        layout.addWidget(QLabel("Slicing Console Output:"))
+        self.slicer_console = QTextEdit()
+        self.slicer_console.setReadOnly(True)
+        layout.addWidget(self.slicer_console)
+
+        # Internal state
+        self._selected_stl = None
+        self._last_gcode = None
+
+        # Connections
+        self.file_btn.clicked.connect(self._select_file)
+        self.slice_btn.clicked.connect(self._start_slice)
+        self.export_btn.clicked.connect(self._export_gcode)
+        self.send_btn.clicked.connect(self._send_gcode)
+
         return tab
+
+    def _select_file(self):
+        fn, _ = QFileDialog.getOpenFileName(self, "Select STL file", os.path.expanduser("~"), "STL Files (*.stl);;All Files (*)")
+        if not fn:
+            return
+        self._selected_stl = fn
+        self.selected_file_label.setText(os.path.basename(fn))
+        self.slice_btn.setEnabled(True)
+
+    def _start_slice(self):
+        if not getattr(self, '_selected_stl', None):
+            QMessageBox.warning(self, "No file", "Please select an STL file first.")
+            return
+
+        slicer_exec = self.slicer_path_line.text().strip()
+        out_dir = os.path.dirname(self._selected_stl)
+        base = os.path.splitext(os.path.basename(self._selected_stl))[0]
+        output_gcode = os.path.join(out_dir, base + ".gcode")
+
+        self.slice_btn.setEnabled(False)
+        self.status_label.setText("Slicing...")
+        self.slicer_console.clear()
+
+        self._slicing_thread = SlicingThread(self._selected_stl, output_gcode, slicer_exec if slicer_exec else None)
+        self._slicing_thread.output_signal.connect(self._append_slicer_output)
+        self._slicing_thread.finished_signal.connect(self._on_slice_finished)
+        self._slicing_thread.start()
+
+    def _append_slicer_output(self, text: str):
+        self.slicer_console.append(text)
+
+    def _on_slice_finished(self, returncode: int, out_path: str):
+        self.slice_btn.setEnabled(True)
+        if returncode == 0 and out_path:
+            self.status_label.setText(f"Slicing complete: {out_path}")
+            self._last_gcode = out_path
+            self.export_btn.setEnabled(True)
+            self.send_btn.setEnabled(self.printer_controller.is_connected)
+            self.slicer_console.append(f"G-code saved to: {out_path}")
+        else:
+            self.status_label.setText("Slicing failed — see console")
+
+    def _export_gcode(self):
+        if not self._last_gcode or not os.path.exists(self._last_gcode):
+            QMessageBox.warning(self, "No G-code", "No generated G-code available to export.")
+            return
+        fn, _ = QFileDialog.getSaveFileName(self, "Export G-code", os.path.expanduser("~"), "G-code Files (*.gcode);;All Files (*)")
+        if not fn:
+            return
+        try:
+            shutil.copy(self._last_gcode, fn)
+            QMessageBox.information(self, "Exported", f"G-code exported to {fn}")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to export: {e}")
+
+    def _send_gcode(self):
+        if not self._last_gcode or not os.path.exists(self._last_gcode):
+            QMessageBox.warning(self, "No G-code", "No generated G-code to send.")
+            return
+        if not self.printer_controller.is_connected:
+            QMessageBox.warning(self, "Not connected", "Please connect to a printer first.")
+            return
+
+        self.send_btn.setEnabled(False)
+        self._sending_thread = SendingThread(self._last_gcode, self.printer_controller)
+        self._sending_thread.progress_signal.connect(lambda v: self.status_label.setText(f"Sending... {v}%"))
+        self._sending_thread.finished_signal.connect(lambda: (self.status_label.setText("Send complete"), self.send_btn.setEnabled(True)))
+        self._sending_thread.start()
 
     def _create_printer_tab(self):
         tab = QWidget()
@@ -336,17 +604,183 @@ class AccessibleSlicerWindow(QMainWindow):
     def _create_preferences_tab(self):
         tab = QWidget()
         layout = QVBoxLayout(tab)
-        self.printer_group = self._create_radio_selection_group("Printer", PRINTER_NAMES, 'printer')
-        self.filament_group = self._create_radio_selection_group("Filament", FILAMENT_NAMES, 'filament')
-        self.quality_group = self._create_radio_selection_group("Quality", PRINT_QUALITIES, 'quality')
+
+        # Slicer CLI path
+        slicer_group = QGroupBox("Slicer / CLI")
+        slicer_layout = QFormLayout(slicer_group)
         self.slicer_path_line = QLineEdit()
-        self.printer_ini_path_line = QLineEdit()
-        self.filament_ini_path_line = QLineEdit()
-        self.quality_ini_path_line = QLineEdit()
-        self.real_time_checkbox = QCheckBox()
-        self.update_interval_spinbox = QSpinBox()
-        self.save_prefs_btn = QPushButton()
+        self.slicer_path_line.setPlaceholderText("Path to PrusaSlicer CLI (optional)")
+        slicer_layout.addRow("PrusaSlicer CLI:", self.slicer_path_line)
+        layout.addWidget(slicer_group)
+
+        # Theme selection
+        theme_group = QGroupBox("Appearance")
+        theme_layout = QHBoxLayout(theme_group)
+        from PyQt6.QtWidgets import QComboBox
+        self.theme_combo = QComboBox()
+        self.theme_combo.addItems(["Classic (Fusion)", "Dark Modern"])
+        self.theme_combo.setAccessibleName("Select application theme")
+        theme_layout.addWidget(QLabel("Theme:"))
+        theme_layout.addWidget(self.theme_combo)
+        layout.addWidget(theme_group)
+
+        # Shortcut preferences
+        shortcuts_group = QGroupBox("Keyboard Shortcuts")
+        shortcuts_layout = QFormLayout(shortcuts_group)
+        # Defaults: Ctrl+S, Ctrl+Shift+S, Ctrl+E
+        self.keyseq_slice = QKeySequenceEdit()
+        self.keyseq_send = QKeySequenceEdit()
+        self.keyseq_export = QKeySequenceEdit()
+        shortcuts_layout.addRow("Slice (default Ctrl+S):", self.keyseq_slice)
+        shortcuts_layout.addRow("Send to printer (default Ctrl+Shift+S):", self.keyseq_send)
+        shortcuts_layout.addRow("Export G-code (default Ctrl+E):", self.keyseq_export)
+        layout.addWidget(shortcuts_group)
+
+        # Preferences actions
+        actions_layout = QHBoxLayout()
+        self.save_prefs_btn = QPushButton("Save Preferences")
+        actions_layout.addStretch(1)
+        actions_layout.addWidget(self.save_prefs_btn)
+        layout.addLayout(actions_layout)
+
+        # Wire up
+        self.save_prefs_btn.clicked.connect(self._save_preferences)
+        self.theme_combo.currentTextChanged.connect(self._on_theme_changed)
+        # When shortcut edits change, update live
+        self.keyseq_slice.keySequenceChanged.connect(lambda seq: self._update_shortcut('slice', seq))
+        self.keyseq_send.keySequenceChanged.connect(lambda seq: self._update_shortcut('send', seq))
+        self.keyseq_export.keySequenceChanged.connect(lambda seq: self._update_shortcut('export', seq))
+
         return tab
+
+    def _on_theme_changed(self, theme_name: str):
+        self.apply_theme(theme_name)
+
+    def _update_shortcut(self, which: str, seq: QKeySequence):
+        # Store temporarily in widget; full save happens on Save Preferences
+        # Also apply immediately
+        seq_str = seq.toString()
+        settings = QSettings()
+        settings.setValue(f'shortcuts/{which}', seq_str)
+        # apply
+        self._setup_shortcuts()
+
+    def apply_theme(self, theme_name: str):
+        app = QApplication.instance()
+        if not app:
+            return
+        if theme_name == "Dark Modern":
+            # Simple dark stylesheet — modern-ish
+            dark_qss = """
+            QWidget { background: #2b2b2b; color: #e6e6e6; }
+            QLineEdit, QTextEdit { background: #3c3f41; color: #e6e6e6; }
+            QPushButton { background: #4b6eaf; color: white; border-radius: 4px; padding: 6px; }
+            QPushButton:hover { background: #5b7ecf; }
+            QGroupBox { border: 1px solid #3c3f41; margin-top: 6px; }
+            QGroupBox::title { subcontrol-origin: margin; left: 8px; padding: 0 3px 0 3px; }
+            QTabWidget::pane { border: 0; }
+            """
+            app.setStyle("Fusion")
+            app.setStyleSheet(dark_qss)
+        else:
+            # Classic / Fusion — clear stylesheet
+            app.setStyle("Fusion")
+            app.setStyleSheet("")
+
+    def _save_preferences(self):
+        settings = QSettings()
+        settings.setValue('slicer/cli_path', self.slicer_path_line.text())
+        settings.setValue('appearance/theme', self.theme_combo.currentText())
+        # Save shortcuts
+        settings.setValue('shortcuts/slice', self.keyseq_slice.keySequence().toString())
+        settings.setValue('shortcuts/send', self.keyseq_send.keySequence().toString())
+        settings.setValue('shortcuts/export', self.keyseq_export.keySequence().toString())
+        settings.sync()
+        QMessageBox.information(self, "Preferences", "Preferences saved.")
+        # Apply shortcuts on save
+        self._setup_shortcuts()
+
+    def _load_preferences(self):
+        settings = QSettings()
+        cli = settings.value('slicer/cli_path', '') or ''
+        theme = settings.value('appearance/theme', 'Classic (Fusion)') or 'Classic (Fusion)'
+
+        # User data JSON next to executable
+        try:
+            app_dir = Path(sys.argv[0]).resolve().parent
+        except Exception:
+            app_dir = Path('.').resolve()
+        user_json = app_dir / 'user_data.json'
+
+        if not user_json.exists():
+            # First run: try to auto-detect PrusaSlicer
+            found = find_prusaslicer()
+            if found:
+                cli = found
+                settings.setValue('slicer/cli_path', cli)
+                try:
+                    user_json.write_text(json.dumps({'prusa_slicer_path': cli}, indent=2))
+                except Exception:
+                    pass
+                QMessageBox.information(self, "PrusaSlicer detected", f"PrusaSlicer found at {found} and will be used.")
+            else:
+                QMessageBox.warning(self, "PrusaSlicer not found", "PrusaSlicer CLI could not be automatically detected. Please set it in Preferences.")
+        else:
+            try:
+                data = json.loads(user_json.read_text())
+                if data.get('prusa_slicer_path') and not cli:
+                    cli = data.get('prusa_slicer_path')
+            except Exception:
+                pass
+
+        self.slicer_path_line.setText(cli)
+        # Set theme combo safely
+        idx = self.theme_combo.findText(theme)
+        if idx >= 0:
+            self.theme_combo.setCurrentIndex(idx)
+        # Apply theme immediately
+        self.apply_theme(theme)
+        # Load shortcuts (or defaults)
+        slice_key = settings.value('shortcuts/slice', 'Ctrl+S') or 'Ctrl+S'
+        send_key = settings.value('shortcuts/send', 'Ctrl+Shift+S') or 'Ctrl+Shift+S'
+        export_key = settings.value('shortcuts/export', 'Ctrl+E') or 'Ctrl+E'
+        try:
+            self.keyseq_slice.setKeySequence(QKeySequence(slice_key))
+            self.keyseq_send.setKeySequence(QKeySequence(send_key))
+            self.keyseq_export.setKeySequence(QKeySequence(export_key))
+        except Exception:
+            pass
+        # Apply shortcuts
+        self._setup_shortcuts()
+
+    def _setup_shortcuts(self):
+        settings = QSettings()
+        slice_key = settings.value('shortcuts/slice', 'Ctrl+S') or 'Ctrl+S'
+        send_key = settings.value('shortcuts/send', 'Ctrl+Shift+S') or 'Ctrl+Shift+S'
+        export_key = settings.value('shortcuts/export', 'Ctrl+E') or 'Ctrl+E'
+
+        # Create or update QShortcut objects
+        try:
+            if hasattr(self, 'shortcut_slice') and self.shortcut_slice:
+                self.shortcut_slice.setKey(QKeySequence(slice_key))
+            else:
+                self.shortcut_slice = QShortcut(QKeySequence(slice_key), self)
+                self.shortcut_slice.activated.connect(self._start_slice)
+
+            if hasattr(self, 'shortcut_send') and self.shortcut_send:
+                self.shortcut_send.setKey(QKeySequence(send_key))
+            else:
+                self.shortcut_send = QShortcut(QKeySequence(send_key), self)
+                self.shortcut_send.activated.connect(self._send_gcode)
+
+            if hasattr(self, 'shortcut_export') and self.shortcut_export:
+                self.shortcut_export.setKey(QKeySequence(export_key))
+            else:
+                self.shortcut_export = QShortcut(QKeySequence(export_key), self)
+                self.shortcut_export.activated.connect(self._export_gcode)
+        except Exception:
+            # Safe fallback: ignore shortcut setup errors
+            pass
 
     def _update_status(self):
         if self.printer_controller.is_connected and self.real_time_updates:
@@ -408,7 +842,7 @@ class AccessibleSlicerWindow(QMainWindow):
         self.send_command_line.returnPressed.connect(self.send_manual_command)
         self.sd_manager_btn.clicked.connect(self.open_sd_manager)
         
-    def _load_preferences(self): pass
+    
     def _handle_profile_selection(self, profile_type, value): pass
     def _update_button_states(self): pass
     def _update_slicer_labels(self): pass
@@ -417,7 +851,7 @@ class AccessibleSlicerWindow(QMainWindow):
 # -----------------------------
 # 4. Run Application
 # -----------------------------
-if __name__ == "__main__":
+if __name__ == "__main__": # just a side note, why __name__ == "__main__"? I don't get it.
     QCoreApplication.setOrganizationName("A3-DS")
     QCoreApplication.setApplicationName("Prefs")
     app = QApplication(sys.argv)

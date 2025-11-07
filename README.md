@@ -19,7 +19,7 @@ The app is designed to make 3D printing workflows with PrusaSlicer more approach
 - pyserial
 - PrusaSlicer (installed separately) — the application expects to call the PrusaSlicer CLI to perform slicing. Make sure PrusaSlicer is installed and its CLI binary is available on PATH, or update the app preferences to point to the PrusaSlicer executable.
 
-Note: The program also uses standard library modules (sys, subprocess, os, shutil, time) which ship with Python.
+Python dependencies are handled by install.py automatically for user covenience.
 
 ## Install (install.py)
 
@@ -61,6 +61,3 @@ This repository does not currently include a license file. Add an appropriate li
 ## Contact / Credits
 
 Built as a small helper/wrapper around PrusaSlicer with accessibility improvements. If you want help developing features or polishing accessibility, file an issue or open a PR.
-
----
-Generated from repository context and project summary.

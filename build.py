@@ -12,6 +12,11 @@ import platform
 import shlex
 import subprocess
 import sys
+import time
+import stat
+import signal
+import ctypes
+from shutil import rmtree
 
 
 REPO_ROOT = os.path.dirname(__file__)
@@ -26,8 +31,42 @@ def run(cmd):
         raise SystemExit(completed.returncode)
 
 
+def _clear_readonly_and_rmtree(path: str):
+    """Attempt to remove a directory tree, clearing readonly flags and retrying.
+
+    This helps when DLLs or files have readonly attributes. If a file is locked
+    by a running process, deletion will still fail; the caller should ensure the
+    process is stopped first.
+    """
+    def _onerror(func, p, exc_info):
+        # Try to clear read-only attribute and retry
+        try:
+            os.chmod(p, stat.S_IWRITE)
+        except Exception:
+            pass
+        try:
+            func(p)
+        except Exception:
+            pass
+
+    # Try a few times with short sleeps to allow handles to close
+    for attempt in range(3):
+        try:
+            if os.path.exists(path):
+                rmtree(path, onerror=_onerror)
+            return True
+        except Exception:
+            time.sleep(0.5)
+    return False
+
 # Executable build, one-folder, Adjust --add-data to include any non-python assets.
 def build_windows():
+    # Remove previous dist folder safely
+    dist_path = os.path.join(REPO_ROOT, 'dist', 'windows', APP_NAME)
+    if os.path.exists(dist_path):
+        ok = _clear_readonly_and_rmtree(dist_path)
+        if not ok:
+            print(f"WARNING: Could not fully remove {dist_path}. Please ensure the app is not running and remove it manually.")
 
     cmd = (
         f"python -m PyInstaller --noconfirm --clean --windowed --name {APP_NAME} "
