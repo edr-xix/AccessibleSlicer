@@ -1,63 +1,34 @@
-# AccessibleSlicer
+# A3DS: Accessible 3-D Slicer
 
-AccessibleSlicer (A3-DS) is a small, accessible PyQt-based wrapper around PrusaSlicer’s command-line interface (CLI). It provides a simple, keyboard- and assistive-technology-friendly GUI for slicing STL files into G-code and for managing basic printer interactions (serial connection, sending G-code, and an SD card file manager mock).
+**A3DS** is a lightweight, high-accessibility GUI wrapper built with PyQt6. It leverages the powerful **PrusaSlicer Command-Line Interface (CLI)** to provide a keyboard-friendly and screen-reader-optimized workflow for 3D printing. 
 
-The app is designed to make 3D printing workflows with PrusaSlicer more approachable for users who need an accessible interface while still leveraging the powerful slicing features provided by PrusaSlicer.
+Whether you are slicing STL files into G-code or managing a printer via a serial connection, A3DS is designed to be utilitarian, straightforward, and fully accessible to users of assistive technology (NVDA, VoiceOver, JAWS, TalkBack).
 
-## Highlights
+## Key Features
 
-- Lightweight PyQt6 UI focused on accessibility.
-- Uses PrusaSlicer CLI for slicing tasks (the application is a wrapper around the PrusaSlicer CLI).
-- Serial communication support for sending commands to printers (via pyserial).
-- SD Card Manager dialog (mocked file list in this repo) for selecting/starting prints.
-- Cross-platform Python app (development and usage notes here are focused on Windows/PowerShell).
+* **Accessibility-First Design:** Fully labeled controls, ARIA-style accessible names, and a logical tab order for seamless screen reader navigation.
+* **CLI Slicing Engine:** Acts as a secure wrapper for the PrusaSlicer/BambuSlicer backend—leveraging industry-standard slicing logic through a simplified interface.
+* **Integrated Printer Control:** Real-time serial communication (via `pyserial`) to send manual G-code, home axes, and monitor temperatures.
+* **SD Card Manager:** Support for listing, starting, and deleting files on the printer's SD card (M20/M23/M24/M30 protocols).
+* **Cross-Platform Persistence:** Settings are dynamically stored in native system paths (`Application Support` on macOS, `AppData` on Windows), ensuring your configurations stay safe across app updates.
 
 ## Requirements
 
-- Python 3.8+ (use the Python you normally run your desktop apps with).
-- PyQt6
-- pyserial
-- PrusaSlicer (installed separately) — the application expects to call the PrusaSlicer CLI to perform slicing. Make sure PrusaSlicer is installed and its CLI binary is available on PATH, or update the app preferences to point to the PrusaSlicer executable.
+* **Python 3.11+**
+* **Dependencies:** `PyQt6`, `pyserial`
+* **Slicer Backend:** PrusaSlicer or BambuSlicer must be installed. During the first run, the **Setup Wizard** will help you locate the executable.
 
-Python dependencies are handled by install.py automatically for user covenience.
+## Installation & Usage
 
-## Install (install.py)
+### For End Users (Binary)
+Download the latest zipped executable for your platform from the **Releases** section on the right side of this repository:
+1.  **Windows:** Unzip the folder and run `A3DS.exe`.
+2.  **macOS:** Drag `A3DS.app` to your Applications folder and open it.
 
-./install.py
-
-1. Checks for dependencies, if not existent installs them.
-2. Checks for build source; if not present in dist, it invokes build. (I might not have integrated this, so run build.py first)
-3. Installs them onto your system, for windows C:\Program Files, linux, /opt/accessible-slicer with a CLI symlink, and on macOS in /Applications/AccessibleSlicer.app
-
-## Run
-
-Simply run it how you would any other app installed on your system.
-
-The application will open a Qt window. Use the Printer tab to select serial port / baud rate and connect to your printer. Use the Slicer tab to pick STL files and invoke the PrusaSlicer CLI (the UI acts as a wrapper for the CLI). The SD Card Manager in this repository currently uses a mocked file list and demonstrates the flow for listing, selecting, starting, and deleting files (M20/M23/M24/M30). Serial interaction is handled by `pyserial`.
-
-## Configuration / Preferences
-
-- The app stores simple preferences via Qt settings. If PrusaSlicer is not on PATH, set the full path to the CLI in the preferences fields (in the Preferences tab).
-- Serial port detection uses `serial.tools.list_ports` from `pyserial` — ports listed depend on the OS and what devices are connected.
-
-## Notes on Accessibility
-
-The UI is built with accessibility in mind: labeled controls, accessible names on some widgets, keyboard-focusable widgets, and clear text for actions. This project aims to provide a more approachable UI for people who rely on assistive technologies when using 3D printing tools.
-
-## Development
-
-- The main application code is in `main.py`.
-- To contribute: fork the repo, create a branch, add features or fixes, and open a pull request describing the change and accessibility considerations.
-
-Suggested small improvements you might consider implementing:
-- Wire the SD Card Manager to parse real M20 responses from printers and dynamically populate files.
-- Add preferences to save the full path to the PrusaSlicer CLI and example slice presets.
-- Add tests for serial communication mocking and UI snapshots (integration tests for the main window).
-
-## License
-
-This repository does not currently include a license file. Add an appropriate license (for example, MIT) if you want to permit reuse.
-
-## Contact / Credits
-
-Built as a small helper/wrapper around PrusaSlicer with accessibility improvements. If you want help developing features or polishing accessibility, file an issue or open a PR.
+### For Developers (Source)
+Clone the repository and install the requirements:
+```bash
+git clone [https://github.com/YourUsername/A3DS.git](https://github.com/YourUsername/A3DS.git)
+cd A3DS
+python -m pip install PyQt6 pyserial
+python A3DSv0.6.4.py
