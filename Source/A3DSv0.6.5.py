@@ -7,6 +7,8 @@ import shutil
 import re
 import time
 import platform
+import urllib.request
+import ssl
 
 # PyQt Imports
 from PyQt6.QtWidgets import (
@@ -22,10 +24,10 @@ from PyQt6.QtCore import QTimer, Qt, QThread, pyqtSignal
 # --- CONSTANTS ---
 APP_NAME = "A3DS"
 FULL_NAME = "Accessible 3-D Slicer"
-APP_VERSION = "v0.6.4"
+APP_VERSION = "v0.6.5"
+UPDATE_URL = "https://api.github.com/repos/edr-xix/AccessibleSlicer/releases/latest"
 
 # --- UNIVERSAL SETTINGS PATH LOGIC ---
-# Ensures settings persist correctly when running as a bundled application
 def get_settings_path():
     app_id = "A3DS"
     if platform.system() == "Windows":
@@ -100,7 +102,8 @@ DEFAULTS = {
     "elefant_foot_comp": 0.0,
     "seam_position": "aligned",
     "wipe_on_retract": 0,
-    "last_run_version": "" 
+    "last_run_version": "",
+    "check_updates_on_startup": 1 
 }
 
 MATERIALS = {
@@ -114,6 +117,25 @@ MATERIALS = {
 }
 
 BAUD_RATES = ["115200", "250000", "230400", "9600"]
+
+# --- UPDATE LOGIC THREAD ---
+class UpdateChecker(QThread):
+    finished = pyqtSignal(dict)
+    def run(self):
+        try:
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) A3DS-Updater',
+                'Accept': 'application/vnd.github.v3+json'
+            }
+            req = urllib.request.Request(UPDATE_URL, headers=headers)
+            context = ssl._create_unverified_context()
+            with urllib.request.urlopen(req, timeout=10, context=context) as response:
+                data = json.loads(response.read().decode())
+                self.finished.emit(data)
+        except urllib.error.HTTPError as e:
+            self.finished.emit({"error": f"HTTP {e.code}"})
+        except Exception as e:
+            self.finished.emit({"error": str(e)})
 
 # --- ACCESSIBLE CONTROLS ---
 class AccessSpinBox(QSpinBox):
@@ -423,7 +445,31 @@ class ParameterDialog(QDialog):
         tab_ret.setLayout(v_ret)
         self.tabs.addTab(tab_ret, "Retraction")
 
-        # TAB 5: About
+        # TAB 5: Updates (Release Notes Moved Here)
+        tab_update = QWidget()
+        up_layout = QVBoxLayout()
+        l_up_head = QHBoxLayout()
+        self.lbl_up_status = QLabel("Current Version: " + APP_VERSION)
+        self.btn_up_check = QPushButton("Check Now")
+        self.btn_up_check.clicked.connect(self.trigger_update_check)
+        l_up_head.addWidget(self.lbl_up_status)
+        l_up_head.addWidget(self.btn_up_check)
+        up_layout.addLayout(l_up_head)
+        
+        self.chk_auto_up = QCheckBox("Check automatically on startup")
+        self.chk_auto_up.setChecked(bool(self.params.get("check_updates_on_startup", 1)))
+        up_layout.addWidget(self.chk_auto_up)
+        
+        up_layout.addSpacing(10)
+        up_layout.addWidget(QLabel("Release Notes:"))
+        self.txt_up_notes = QTextEdit()
+        self.txt_up_notes.setReadOnly(True)
+        self.txt_up_notes.setHtml(RELEASE_NOTES)
+        up_layout.addWidget(self.txt_up_notes)
+        tab_update.setLayout(up_layout)
+        self.tabs.addTab(tab_update, "Updates")
+
+        # TAB 6: About
         tab_about = QWidget()
         about_layout = QVBoxLayout()
         title = QLabel(f"{APP_NAME} {APP_VERSION}")
@@ -437,16 +483,7 @@ class ParameterDialog(QDialog):
         credit.setStyleSheet("font-style: italic;")
         about_layout.addWidget(credit)
         
-        about_layout.addSpacing(10)
-        lbl_notes = QLabel("Release Notes:")
-        lbl_notes.setStyleSheet("font-weight: bold;")
-        about_layout.addWidget(lbl_notes)
-        
-        self.txt_notes = QTextEdit()
-        self.txt_notes.setReadOnly(True)
-        self.txt_notes.setHtml(RELEASE_NOTES)
-        about_layout.addWidget(self.txt_notes)
-        
+        about_layout.addStretch()
         tab_about.setLayout(about_layout)
         self.tabs.addTab(tab_about, "About")
 
@@ -490,6 +527,29 @@ class ParameterDialog(QDialog):
     def update_dialog_title(self, index):
         tab_name = self.tabs.tabText(index)
         self.setWindowTitle(f"Settings - {tab_name}")
+
+    def trigger_update_check(self):
+        self.btn_up_check.setEnabled(False)
+        self.lbl_up_status.setText("Connecting...")
+        self.up_thread = UpdateChecker()
+        self.up_thread.finished.connect(self.on_up_finished)
+        self.up_thread.start()
+
+    def on_up_finished(self, data):
+        self.btn_up_check.setEnabled(True)
+        if "error" in data:
+            self.lbl_up_status.setText(f"Error: {data['error']}")
+            return
+        latest = data.get("tag_name", APP_VERSION)
+        body = data.get("body", "No release notes found on GitHub.")
+        self.txt_up_notes.setPlainText(body)
+        if latest != APP_VERSION:
+            self.lbl_up_status.setText(f"Update Found: {latest}")
+            if QMessageBox.question(self, "Update", f"New version {latest} found. View release?") == QMessageBox.StandardButton.Yes:
+                import webbrowser
+                webbrowser.open(data.get("html_url", ""))
+        else:
+            self.lbl_up_status.setText(f"Up to date: {APP_VERSION}")
 
     def on_mat_toggle(self, btn, checked):
         if not checked: return
@@ -539,6 +599,7 @@ class ParameterDialog(QDialog):
         self.params["layer_height"] = self.spin_layer.value()
         self.params["infill_density"] = self.spin_infill.value()
         self.params["elefant_foot_comp"] = self.spin_ele.value()
+        self.params["check_updates_on_startup"] = 1 if self.chk_auto_up.isChecked() else 0
         
         if self.rad_seam_aligned.isChecked(): self.params["seam_position"] = "aligned"
         elif self.rad_seam_nearest.isChecked(): self.params["seam_position"] = "nearest"
@@ -1178,9 +1239,23 @@ class CombinedWindow(QMainWindow):
                     ReleaseNotesDialog(self).exec()
                     self.params["last_run_version"] = APP_VERSION; self.save_settings()
                 if not self.slicer_exe: self.run_wizard()
+                
+                # Silent background check on startup
+                if self.params.get("check_updates_on_startup", 1):
+                    self.perform_auto_check()
             except: self.run_wizard()
         else:
             self.run_wizard()
+
+    def perform_auto_check(self):
+        self.auto_up = UpdateChecker()
+        self.auto_up.finished.connect(self.on_auto_up_finished)
+        self.auto_up.start()
+
+    def on_auto_up_finished(self, data):
+        if "error" not in data and data.get("tag_name") != APP_VERSION:
+            if QMessageBox.question(self, "Update", "New version available. Open Settings?") == QMessageBox.StandardButton.Yes:
+                self.open_config()
 
     def run_wizard(self):
         wiz = SetupWizard(self.params, self)
@@ -1217,8 +1292,6 @@ class CombinedWindow(QMainWindow):
             QMessageBox.warning(self, "Error", "Missing file or slicer."); return
         
         p = self.params; scale_factor = self.spin_scale.value() / 100.0
-        
-        # Universal Scaling Logic for Purge and Presentation
         safe_x = float(p['bed_x']) * 0.05
         safe_y = float(p['bed_y']) * 0.05
         safe_z = 2.0
@@ -1254,14 +1327,12 @@ brim_width = {p['brim_width'] if self.chk_brim.isChecked() else 0}
 start_gcode = G28 ; Home axes\\nG1 Z{safe_z} F3000\\nG1 X{safe_x} Y{safe_y} F5000\\nM109 S[temperature]\\nM190 S[bed_temperature]
 end_gcode = M104 S0\\nM140 S0\\nG91\\nG1 E-1 F2700\\nG1 Z10\\nG90\\nG1 X0 Y{present_y}\\nM84
 """
-
         if self.chk_3mf.isChecked():
             out_f, _ = QFileDialog.getSaveFileName(self, "Save 3MF Project", f"{os.path.splitext(os.path.basename(self.model_path))[0]}.3mf", "3MF Project (*.3mf)")
         else:
             out_f, _ = QFileDialog.getSaveFileName(self, "Save G-code", f"{os.path.splitext(os.path.basename(self.model_path))[0]}.gcode", "G-code (*.gcode)")
         
         if not out_f: return
-
         try:
             fd, cfg_path = tempfile.mkstemp(suffix=".ini", text=True)
             with os.fdopen(fd, 'w') as tmp:

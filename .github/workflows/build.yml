@@ -1,0 +1,37 @@
+name: Build A3DS Executables
+on:
+  push:
+    tags:
+      - 'v*' # Triggers build when you push a tag like v0.6.5
+
+jobs:
+  package:
+    name: Build on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [windows-latest, macos-latest]
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install Dependencies
+        run: |
+          pip install PyQt6 pyserial requests pyinstaller
+
+      - name: Run PyInstaller
+        run: |
+          pyinstaller --onedir --windowed --noconfirm --name "A3DS_${{ matrix.os }}" Source/A3DSv0.6.4.py
+
+      - name: Release Binaries
+        uses: softprops/action-gh-release@v1
+        with:
+          files: dist/**
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
