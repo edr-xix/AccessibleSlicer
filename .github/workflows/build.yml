@@ -1,37 +1,75 @@
 name: Build A3DS Executables
+
 on:
   push:
     tags:
-      - 'v*' # Triggers build when you push a tag like v0.6.5
+      - 'v*' # Triggers build when you push a tag like v0.7.0
+
+permissions:
+  contents: write # needed so the workflow can create the GitHub release
 
 jobs:
   package:
-    name: Build on ${{ matrix.os }}
+    name: Build on ${{ matrix.label }}
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false # if one platform fails, still build the other
       matrix:
-        os: [windows-latest, macos-latest]
+        include:
+          - os: windows-latest
+            label: Windows
+          - os: macos-latest
+            label: macOS
 
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
       - name: Install Dependencies
         run: |
-          pip install PyQt6 pyserial requests pyinstaller
+          python -m pip install --upgrade pip
+          pip install PyQt6 pyserial paho-mqtt certifi pyinstaller
+
+      # The in-app update checker compares the GitHub tag to APP_VERSION,
+      # so make sure they match before building anything.
+      - name: Check tag matches APP_VERSION
+        shell: bash
+        run: |
+          APP_VERSION=$(sed -n 's/^APP_VERSION = "\(.*\)"/\1/p' Source/A3DS.py)
+          echo "Tag: $GITHUB_REF_NAME / APP_VERSION: $APP_VERSION"
+          if [ "$APP_VERSION" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match APP_VERSION $APP_VERSION in Source/A3DS.py"
+            exit 1
+          fi
+
+      - name: Syntax check
+        run: python -m py_compile Source/A3DS.py
 
       - name: Run PyInstaller
         run: |
-          pyinstaller --onedir --windowed --noconfirm --name "A3DS_${{ matrix.os }}" Source/A3DSv0.6.4.py
+          pyinstaller --onedir --windowed --noconfirm --name "A3DS" --hidden-import paho.mqtt.client --collect-data certifi Source/A3DS.py
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path dist/A3DS/* -DestinationPath "A3DS-${{ github.ref_name }}-Windows.zip"
+
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          ditto -c -k --sequesterRsrc --keepParent dist/A3DS.app "A3DS-${{ github.ref_name }}-macOS.zip"
 
       - name: Release Binaries
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
-          files: dist/**
+          files: A3DS-${{ github.ref_name }}-${{ matrix.label }}.zip
+          fail_on_unmatched_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
